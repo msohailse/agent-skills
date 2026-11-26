@@ -20,7 +20,8 @@ Then prove it in that runtime before converting anything: a `.ts` file using `re
 These come from what Node's type stripper accepts and what keeps the mix working:
 
 - **Erasable syntax only.** Types, interfaces, `type` aliases, `import type`, `satisfies` and `as` casts are fine. Enums, namespaces, parameter properties and `import x = require()` are not, because they need code generated. Use a const object plus a union type in place of an enum.
-- **Stay CommonJS.** Use `require` and `module.exports`. Switching to ESM `import`/`export` changes load order, and that matters (dotenv and APM agents usually have to load first).
+- **Stay CommonJS.** Use `require` and `module.exports`, never `import x from` or `export const`. If Node sees ESM syntax in a `.ts` file it loads the file as an ES module, and `module.exports` then throws. `verbatimModuleSyntax` in the tsconfig makes tsc reject that syntax before it ships. ESM would also change load order, which matters: dotenv and APM agents usually have to load first.
+- **Types from packages** come in with `import type { Request, Response } from 'express'`, which Node erases completely.
 - **Require with the extension.** `require('./thing.service.ts')`. An extensionless require does not find a `.ts` file.
 - **Typing a sibling module.** `require()` returns `any` in a `.ts` file. When you want a dependency typed, the dependency exports its shape (`export type Service = typeof service`), and the caller writes `import type { Service } from './service.ts'` plus `const service: Service = require('./service.ts')`.
 - **No behaviour changes in a conversion PR.** Keep loose comparisons, truthiness checks and `any` where the old code relied on them. Tighten in a separate, tested PR.
@@ -35,12 +36,13 @@ Each phase is its own PR, can ship on its own and can be reverted on its own.
    - Pin exact versions, and skip anything published in the last few days. Choose the TypeScript major on purpose: a new major can change how JS files are checked, so move to it in its own PR later.
    - Keep the compiler out of the production image. If the Dockerfile runs a plain `npm install`, typescript ships with it as dead weight; install with `npm ci --omit=dev` there.
    - Read the lockfile diff. A newer `@types/node` can move a hoisted copy that other packages' types depend on, which is harmless but worth saying in the PR.
-1. **Migration rules.** Add the PR check from step 5, the queued-files list, and the agent guidance (all in [Files to add](#files-to-add)).
-2. **Leaf modules,** one file per PR: services, helpers and utilities that few files depend on. Write any new file as `.ts` from day one.
-3. **Upgrade the ORM separately** before typing models if its version has weak typings or open security advisories (for example Mongoose 5 to 6+). Otherwise you type everything twice.
-4. **Models.**
-5. **Routes, then small controllers, then the big ones last.** Add tests for a controller's main paths before converting it.
-6. **Tighten:** request validation at the HTTP boundary (zod or similar), stricter options, `checkJs` on.
+   - Optionally turn on `// @ts-check` for a couple of tiny JS files. Under `strict`, a bare `@ts-check` fails on untyped `req`/`res`/`next` parameters, so add JSDoc types (comments only) rather than code changes.
+1. **Guardrails.** Add the migration-rules PR check from step 5, the queued-files list and the agent guidance. Also add the require-resolution check (both are in [Files to add](#files-to-add)). With `checkJs` off, tsc won't report a `.js` file that still requires a renamed module, and a missed rename crashes the app at boot. Don't count on a deploy healthcheck to catch that. If the repo uses nodemon, set its `ext` to `js,ts,json` so dev restarts on `.ts` changes.
+2. **Leaf modules,** one file per PR. Start with files that require no other app modules, then work inward: services, helpers, utilities. Write any new file as `.ts` from day one. Beyond typecheck and tests, deploy each one to staging and hit `/health` plus a few read-only endpoints of the module you changed.
+3. **Upgrade the ORM on its own,** before typing models, if its version has weak typings or open security advisories (for example Mongoose 5 to a supported major). Otherwise you type everything twice. Keep this PR in plain JS with no type work mixed in. Watch for removed callback APIs (code and tests that still pass a callback to `findOneAndUpdate`), changed `strictQuery` defaults, and changed return values from `lean()` and `findOneAndUpdate`. Verify on staging with read-only traffic, and remember that staging and production sometimes share a database cluster.
+4. **Models.** One interface per schema. Schemas with `strict: false` hold open-ended documents, so type them loosely: known fields plus an index signature. Don't change schema options or indexes in these PRs.
+5. **Routes, then small controllers, then the big ones last.** A shared CRUD factory becomes a generic. Split the largest controllers before converting them. Before converting a controller, add a test that pins its response shape.
+6. **Tighten.** Turn `checkJs` on folder by folder for whatever JS is left, add request validation at the HTTP boundary (zod or similar), and leave the entry files (`app.js`, the APM and env bootstrap, `bin/www`) as plain JS.
 
 ## 4. Converting a file, in short
 
@@ -84,7 +86,7 @@ Use this for every file. One file per PR keeps review small and makes a revert t
    - Keep `require` / `module.exports`. Keep the order of top-level requires.
    - If the compiler forces a real change (a genuine bug), make it a separate commit with its own test, or a separate PR.
 4. **Update callers.** Every `require('./name')` becomes `require('./name.ts')`. Search source, tests, scripts, seeders and anything that loads modules by path.
-5. **Update test stubs.** Search `tests/` for the old filename in `Module._load` hooks, proxyquire paths, `jest.mock` calls, or regexes like `name(\.js)?$`. A stub that stops matching doesn't fail; it quietly loads the real module.
+5. **Update test stubs.** Search `tests/` for the old filename in `Module._load` hooks, proxyquire paths, `jest.mock` calls, or regexes like `name(\.js)?$`. A stub that stops matching doesn't fail; it quietly loads the real module. Keep test files `.js` if the test runner's glob only picks up `*.js`. For a module that writes to a cache or queue, add a test that pins the key names and encoding before converting it.
 6. **Verify.**
    - `npm run typecheck`: clean.
    - Unit tests: the same passing count as before.
@@ -130,10 +132,21 @@ With `checkJs` off, tsc doesn't report a `require('./x')` in a `.js` file that n
 Old ORM versions have weak or wrong types (Mongoose 5, for example). Typing models on them, then upgrading, is double work, and these versions often have security advisories anyway. Upgrade first, as its own tested PR.
 
 ### Monitoring
-Stack traces in APM and error tools point at real line numbers with type stripping, since whitespace is preserved. With a `dist/` build you need source maps.
+Type stripping replaces types with whitespace, so line and column numbers stay the same. Stack traces in APM, error trackers and chat alerts point at the real source with no source maps. With a `dist/` build you need source maps.
+
+### Node version and base images
+Type stripping needs Node 22.18+ or 23.6+, and every image that might run the app has to qualify. A private-registry base image tagged like the public one can lag behind it, so check `node -v` inside each image before it's deployed. Files under `node_modules` are never stripped, so dependencies still have to ship JavaScript.
 
 ### Fallback: a dist/ build
-Only if type stripping blocks something (old Node in production, or syntax you truly need): compile with `tsc` (`allowJs`, CommonJS output) to `dist/`, copy static assets, run `node dist/bin/www`, ship source maps, and update the Dockerfile and start command. Prove the build with zero `.ts` files first.
+Only use this if type stripping blocks something: old Node in production, or a dependency or feature that needs enums or decorators.
+- Compile with `tsc` (`allowJs`, CommonJS output) to `dist/`.
+- Copy the static assets and any JSON read by path next to the output.
+- Keep dotenv and APM in a plain JS entry that loads first.
+- Turn source maps on for APM.
+- Keep the path-matching tests running against the source, not `dist/`.
+- Update the Dockerfile and start command, and prove the build with zero `.ts` files first.
+
+It changes how the app deploys, which is why it isn't the default.
 
 ## Files to add
 
@@ -253,6 +266,47 @@ if (problems.length) {
 console.log('Migration rules met.');
 ```
 
+### `scripts/check-requires.js`
+
+Fails when a relative `require()` in a tracked `.js` or `.ts` file no longer resolves under Node's own rules, for example a caller still requiring `./x` after `x.js` became `x.ts`. Run it in the same workflow as the rules check.
+
+```js
+'use strict';
+
+// Fails when a relative require() in any tracked .js or .ts file no longer resolves,
+// e.g. a caller still requiring './x' after x.js became x.ts. Resolution uses Node's
+// own rules (createRequire), so it matches what happens at boot. Commented-out code is skipped.
+const { execSync } = require('child_process');
+const { createRequire } = require('module');
+const fs = require('fs');
+const path = require('path');
+
+const root = process.cwd();
+const files = execSync('git ls-files "*.js" "*.ts" "*.cjs"', { cwd: root }).toString().split('\n')
+  .filter((f) => f && !f.startsWith('node_modules/') && !f.endsWith('.d.ts'));
+
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/.*$/gm, '$1');
+}
+
+const misses = [];
+files.forEach((file) => {
+  const abs = path.join(root, file);
+  const src = stripComments(fs.readFileSync(abs, 'utf8'));
+  const req = createRequire(abs);
+  for (const m of src.matchAll(/require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)/g)) {
+    try { req.resolve(m[1]); } catch (e) { misses.push(file + ': require(\'' + m[1] + '\') does not resolve'); }
+  }
+});
+
+if (misses.length) {
+  console.log('Broken relative requires:');
+  misses.forEach((m) => console.log('  - ' + m));
+  process.exit(1);
+}
+console.log('All relative requires resolve (' + files.length + ' files).');
+```
+
 ### `.github/workflows/migration-rules.yml`
 
 ```yaml
@@ -273,6 +327,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+      - name: Check relative requires resolve
+        run: node scripts/check-requires.js
       - name: Check migration rules
         run: node scripts/check-ts-migration.js
         env:
@@ -294,3 +350,9 @@ This codebase is being converted to TypeScript one file at a time. The plan is `
 - A converted file has no `.js` copy. Edit the `.ts` file.
 - If your task needs a queued file changed, stop and tell the person you're working for to check the migration plan, rather than working around the check.
 ```
+
+## Keeping this skill current
+
+This skill is meant to grow with real migrations. When a conversion teaches something new (a break you didn't expect, a check that saved you, a step that turned out unnecessary), add it to the matching section above in the same plain style. Keep a short dated line here:
+
+- 2026-11: first version, from converting a service in a production Express + Mongoose API. Lessons so far: type stripping on Node 24 works for CommonJS `.ts` required with the extension; path-matching test stubs and extensionless requires are the most common silent breaks; and sealed-network container runs catch hard-coded production URLs.
