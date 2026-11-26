@@ -31,7 +31,10 @@ Use the tsconfig in [Files to add](#files-to-add) and adjust its `include` list 
 
 Each phase is its own PR, can ship on its own and can be reverted on its own.
 
-0. **Type checking only.** Add pinned `typescript`, `@types/node` and the framework's `@types/*` as dev dependencies, the tsconfig, an `npm run typecheck` script (`tsc -p tsconfig.json`), and a typecheck step in the existing CI test job. Nothing in runtime changes.
+0. **Type checking only.** Add `typescript`, `@types/node` (matching the production Node major) and the framework's `@types/*` as dev dependencies, the tsconfig, an `npm run typecheck` script (`tsc -p tsconfig.json`), and a typecheck step in the existing CI test job. Nothing in runtime changes.
+   - Pin exact versions, and skip anything published in the last few days. Choose the TypeScript major on purpose: a new major can change how JS files are checked, so move to it in its own PR later.
+   - Keep the compiler out of the production image. If the Dockerfile runs a plain `npm install`, typescript ships with it as dead weight; install with `npm ci --omit=dev` there.
+   - Read the lockfile diff. A newer `@types/node` can move a hoisted copy that other packages' types depend on, which is harmless but worth saying in the PR.
 1. **Migration rules.** Add the PR check from step 5, the queued-files list, and the agent guidance (all in [Files to add](#files-to-add)).
 2. **Leaf modules,** one file per PR: services, helpers and utilities that few files depend on. Write any new file as `.ts` from day one.
 3. **Upgrade the ORM separately** before typing models if its version has weak typings or open security advisories (for example Mongoose 5 to 6+). Otherwise you type everything twice.
@@ -118,6 +121,10 @@ Hooks such as `Module._load`, proxyquire and `jest.mock('./x')` match on the res
 ### Circular requires
 CommonJS cycles give a partially filled `module.exports` object. Destructuring at require time (`const { fn } = require('./a')`) captures `undefined` in a cycle.
 *Check:* run a cycle detector (madge, or a small DFS over relative requires) before converting the files involved.
+
+### Broken require paths in .js files
+With `checkJs` off, tsc doesn't report a `require('./x')` in a `.js` file that no longer resolves, for example after `x.js` became `x.ts`. The first sign is a MODULE_NOT_FOUND crash at boot.
+*Check:* add a small CI step that resolves every relative `require` in the repo (walk the files, `require.resolve` each path from its file's folder, fail on any miss), and boot-load changed files in the production image.
 
 ### ORM typings
 Old ORM versions have weak or wrong types (Mongoose 5, for example). Typing models on them, then upgrading, is double work, and these versions often have security advisories anyway. Upgrade first, as its own tested PR.
