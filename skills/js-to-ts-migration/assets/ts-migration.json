@@ -1,8 +1,0 @@
-{
-  "doc": "docs/typescript-migration.md",
-  "label": "typescript",
-  "tsOnlyDirs": ["src/services/"],
-  "inProgress": [
-    "src/services/example.service.js"
-  ]
-}
