@@ -1,6 +1,18 @@
 ---
 name: js-to-ts-migration
 description: Incrementally convert a CommonJS Node.js codebase (Express, Mongoose and similar) from JavaScript to TypeScript one file at a time, with no build step, using Node 22.18+/24's built-in type stripping. Covers setting up tsc type checking in CI, converting a single file safely, keeping the .js and .ts mix working, and a PR check that enforces the migration rules. Use this whenever someone wants to move a Node/Express backend to TypeScript, write a new file in TypeScript inside a JavaScript repo, convert "just this one service" to .ts, plan a TS migration, or asks whether converting a running API to TypeScript is safe, even if they don't say "migration".
+category: development
+risk: safe
+source: https://github.com/msohailse/agent-skills
+source_repo: msohailse/agent-skills
+source_type: community
+date_added: '2026-11-26'
+license: MIT
+license_source: https://github.com/msohailse/agent-skills/blob/main/LICENSE
+compatibility: Node.js 22.18+ or 23.6+ (Node 24 recommended) for built-in type stripping; CommonJS codebases.
+metadata:
+  author: Muhammad Sohail
+  version: '1.0'
 ---
 
 # JS to TS migration (Node type stripping, no build)
