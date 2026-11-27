@@ -1,6 +1,6 @@
 ---
 name: js-to-ts-migration
-description: Incrementally convert a CommonJS Node.js codebase (Express, Mongoose and similar) from JavaScript to TypeScript one file at a time, with no build step, using Node 22.18+/24's built-in type stripping. Covers setting up tsc type checking in CI, converting a single file safely, keeping the .js and .ts mix working, and a PR check that enforces the migration rules. Use this whenever someone wants to move a Node/Express backend to TypeScript, write a new file in TypeScript inside a JavaScript repo, convert "just this one service" to .ts, plan a TS migration, or asks whether converting a running API to TypeScript is safe, even if they don't say "migration". Also use it to audit or review a TypeScript migration that someone or an AI agent already did: hand-written library types, unchecked typed requires, `!`/`as` added to silence the compiler, or "strict mode passes, so is it fine?".
+description: Incrementally convert a CommonJS Node.js codebase (Express, Mongoose and similar) from JavaScript to TypeScript one file at a time, with no build step, using Node 22.18+/24's built-in type stripping. Covers setting up tsc type checking in CI, converting a single file safely, keeping the .js and .ts mix working, and a PR check that enforces the migration rules. Use this whenever someone wants to move a Node/Express backend to TypeScript, write a new file in TypeScript inside a JavaScript repo, convert "just this one service" to .ts, plan a TS migration, or asks whether converting a running API to TypeScript is safe, even if they don't say "migration". Also use it to audit or review a TypeScript migration that someone or an AI agent already did, such as hand-written library types, unchecked typed requires, `!`/`as` added to silence the compiler, or "strict mode passes, so is it fine?".
 category: development
 risk: safe
 source: https://github.com/msohailse/agent-skills
@@ -157,7 +157,7 @@ Each phase is its own PR, can ship on its own and can be reverted on its own.
 1. **Guardrails.** Add the migration-rules PR check from step 5, the queued-files list and the agent guidance. Also add the require-resolution check (both are in [Files to add](#files-to-add)). With `checkJs` off, tsc won't report a `.js` file that still requires a renamed module, and a missed rename crashes the app at boot. Don't count on a deploy healthcheck to catch that. If the repo uses nodemon, set its `ext` to `js,ts,json` so dev restarts on `.ts` changes.
 2. **Leaf modules,** one file per PR. Start with files that require no other app modules, then work inward: services, helpers, utilities. Write any new file as `.ts` from day one. Beyond typecheck and tests, deploy each one to staging and hit `/health` plus a few read-only endpoints of the module you changed.
 3. **Upgrade the ORM on its own,** before typing models, if its version has weak typings or open security advisories (for example Mongoose 5 to a supported major). Otherwise you type everything twice. Keep this PR in plain JS with no type work mixed in. Watch for removed callback APIs (code and tests that still pass a callback to `findOneAndUpdate`), changed `strictQuery` defaults, and changed return values from `lean()` and `findOneAndUpdate`. Verify on staging with read-only traffic, and remember that staging and production sometimes share a database cluster.
-4. **Models.** One interface per schema, passed to the ORM's own generics (`new Schema<T>()`, `model<T>()`), so every query is checked against the real ORM types. The interface describes the document, never the ORM's methods. Schemas with `strict: false` hold open-ended documents, so type them loosely: known fields plus an index signature. Don't change schema options or indexes in these PRs.
+4. **Models.** One interface per schema, passed to the ORM's own generics (`new Schema<T>()`, `model<T>()`), so every query is checked against the real ORM types. The interface describes the document, never the ORM's methods. It is still a second description of the same fields: on Mongoose 5 `new Schema<T>()` does not compare the schema with `T` (swapped, missing and extra fields all compile), so review the two side by side and change them in the same PR. Schemas with `strict: false` hold open-ended documents, so type them loosely: known fields plus an index signature. Don't change schema options or indexes in these PRs.
 5. **Routes, then small controllers, then the big ones last.** A shared CRUD factory becomes a generic over the ORM's model type (`Model<T>`), not a hand-written interface of the methods it calls. Split the largest controllers before converting them. Before converting a controller, add a test that pins its response shape.
 6. **Tighten.** Turn on the extra strict flags one at a time, turn `checkJs` on folder by folder for whatever JS is left, add request validation at the HTTP boundary (zod or similar), and leave the entry files (`app.js`, the APM and env bootstrap, `bin/www`) as plain JS.
 
@@ -459,6 +459,7 @@ changedFiles().filter((c) => c.status !== 'D' && isTs(c.file) && fs.existsSync(p
     const type = m[2].trim();
     const spec = m[3];
     if (/^typeof\s/.test(type)) return;
+    if (/^(any|unknown)$/.test(type)) return; // honestly unchecked: no claim is made about the module
     const ident = (type.match(/^[A-Za-z_$][\w$]*/) || [''])[0];
     const importedFromSameModule = ident && new RegExp(
       'import\\s+type\\s*\\{[^}]*\\b' + escapeRe(ident) + '\\b[^}]*\\}\\s*from\\s*[\'"]' + escapeRe(spec) + '[\'"]'
@@ -486,6 +487,8 @@ git('diff -U0 ' + base + '...HEAD -- "*.ts"').forEach((l) => {
   const at = file + ':' + lineNo;
   lineNo += 1;
   if (ALLOW.test(text)) return;
+  if (/^\s*(\/\*|\*)/.test(text)) return; // comment text, e.g. "same as before"
+  if (/^\s*(type\s+)?[\w$]+\s+as\s+[\w$]+\s*,?\s*$/.test(text)) return; // `a as b,` inside a multi-line import
   const code = codeOf(text);
   if (/^\s*(import|export)\s/.test(code)) return; // `import { a as b }` renames, not casts
   if (NON_NULL.test(code)) {
@@ -498,7 +501,10 @@ git('diff -U0 ' + base + '...HEAD -- "*.ts"').forEach((l) => {
 
 // skipLibCheck only with a recorded reason.
 const tsconfigPath = path.join(root, 'tsconfig.json');
-if (fs.existsSync(tsconfigPath) && /"skipLibCheck"\s*:\s*true/.test(fs.readFileSync(tsconfigPath, 'utf8'))) {
+const tsconfigText = fs.existsSync(tsconfigPath)
+  ? fs.readFileSync(tsconfigPath, 'utf8').replace(/\/\*[\s\S]*?\*\/|^\s*\/\/.*$/gm, '') // tsconfig allows comments
+  : '';
+if (/"skipLibCheck"\s*:\s*true/.test(tsconfigText)) {
   const reasons = config.skipLibCheckBecause || [];
   if (!reasons.length) {
     problems.push('tsconfig.json: migration rule: skipLibCheck is on, but skipLibCheckBecause in ' + configPath +
@@ -535,7 +541,9 @@ const files = execSync('git ls-files "*.js" "*.ts" "*.cjs"', { cwd: root }).toSt
   .filter((f) => f && !f.startsWith('node_modules/') && !f.endsWith('.d.ts'));
 
 function stripComments(src) {
-  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/.*$/gm, '$1');
+  // Strings and escapes are matched first and kept, so '/*' or '//' inside them isn't read as a comment.
+  const token = /(\\.|'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/.*$/gm;
+  return src.replace(token, (match, keep) => keep || '');
 }
 
 const misses = [];
