@@ -12,12 +12,12 @@ license_source: https://github.com/msohailse/agent-skills/blob/main/LICENSE
 compatibility: Node.js 22.18+ or 23.6+ (Node 24 recommended) for built-in type stripping; CommonJS codebases.
 metadata:
   author: Muhammad Sohail
-  version: '1.1'
+  version: '1.2'
 ---
 
 # JS to TS migration (Node type stripping, no build)
 
-A one-shot conversion of a live JavaScript API almost always breaks a caller somewhere. The conversion itself changes nothing; the breakage comes from what people "fix" while satisfying the compiler, and from build and load-order changes. This skill gets a repo to TypeScript one small, revertable PR at a time, with production behaviour unchanged at every step.
+A one-shot conversion of a live JavaScript API almost always breaks a caller somewhere. The conversion itself changes nothing; the breakage comes from what people "fix" while satisfying the compiler, and from build and load-order changes. This skill gets a repo to TypeScript in small, revertable PRs, several open at once where they don't depend on each other, with production behaviour unchanged at every step.
 
 The approach: new and converted files are `.ts`, and Node runs them directly by stripping the types. The repo stays CommonJS. `tsc --noEmit` type-checks the `.js` and `.ts` mix in CI. A PR check enforces the rules so parallel work doesn't collide with the migration.
 
@@ -34,12 +34,13 @@ These come from what Node's type stripper accepts and what keeps the mix working
 - **Erasable syntax only.** Types, interfaces, `type` aliases, `import type` and `satisfies` are fine. Enums, namespaces, parameter properties and `import x = require()` are not, because they need code generated. Use a const object plus a union type in place of an enum.
 - **Stay CommonJS.** Use `require` and `module.exports`, never `import x from` or `export const`. If Node sees ESM syntax in a `.ts` file it loads the file as an ES module, and `module.exports` then throws. `verbatimModuleSyntax` in the tsconfig makes tsc reject that syntax before it ships. ESM would also change load order, which matters: dotenv and APM agents usually have to load first.
 - **Require with the extension.** `require('./thing.service.ts')`. An extensionless require does not find a `.ts` file.
-- **Types come from the real code, never from a hand-written copy.** `require()` returns `any` in a `.ts` file, so a type written on the left of it is never checked against anything: the compiler just believes it. Always derive it:
+- **A hand-written type for an official package is always wrong.** If a package ships types or has an `@types` package, import those. Don't describe it yourself, in any form: not an interface on a `require`, not an `as` cast, not `declare module 'pkg' { ... }`. This holds even when the official types fail to compile; that is what [Library types](#library-types-one-library-at-a-time) is for.
+- **Types come from the real code, never from a hand-written copy.** `require()` returns `any` in a `.ts` file, so a type written on the left of it is never checked against anything: the compiler just believes it. First try importing the real TypeScript interfaces the library or module already provides, and always derive from them:
   - From a package: types with `import type { Request, Response } from 'express'`, and a required value with `const mongoose: typeof import('mongoose') = require('mongoose')`. Node erases both annotations.
   - From a sibling module: the module exports its own shape (`export type Service = typeof service`), and the caller writes `import type { Service } from './service.ts'` plus `const service: Service = require('./service.ts')`.
 
-  Never write `const x: SomeInterface = require(...)` with an interface you wrote to describe that library or module. It compiles, it looks typed, and nothing ever compares it with the real thing, so it is wrong the moment it doesn't match and stays wrong as the real code changes. It's worse than `any`: `any` tells the next reader nothing is checked, and a hand-written type tells them something is.
-- **Don't silence the compiler.** Don't add `!` non-null assertions or `as` casts to make an error go away (`as const` is fine). If the compiler found a real problem, the bug was already there: keep the line as it was, using `any` where needed, and fix the bug in its own tested PR. The PR check flags new `!` and `as`. A justified one carries a `// ts-migration: <reason>` comment on the same line.
+  Never write `const x: SomeInterface = require(...)` with an interface you wrote to describe that library or module. It compiles, it looks typed, and nothing ever compares it with the real thing, so it is wrong the moment it doesn't match and stays wrong as the real code changes. It's worse than `any`: `any` tells the next reader nothing is checked, and a hand-written type tells them something is. Just dropping the annotation isn't a fix either: that leaves `any`.
+- **Don't silence the compiler.** Don't add `!` non-null assertions or `as` casts to make an error go away (`as const` is fine). If the compiler found a real problem, the bug was already there: keep what it does at runtime and fix the bug in its own tested PR. To get it compiling, narrow first if that behaves identically (for a missing row that already ended in a caught 500, `if (!row) throw ...` keeps the 500 and keeps the types) and add a test that shows it. Use `any` only when narrowing would change behaviour. The PR check flags new `!` and `as`. A justified one carries a `// ts-migration: <reason>` comment on the same line.
 - **`strict` only, during the migration.** Extra flags such as `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes` on loosely typed code produce hundreds of `!`, `?.` and `?? ''` edits. Those either hide the warnings the flags exist for, or change what callers receive. Turn them on in phase 6, one at a time, once the types are real.
 - **No behaviour changes in a conversion PR.** Keep loose comparisons, truthiness checks and `any` where the old code relied on them. Tighten in a separate, tested PR.
 
@@ -105,13 +106,27 @@ Use the tsconfig in [Files to add](#files-to-add) and adjust its `include` list 
 
 ### Library types, one library at a time
 
-Every library the converted code touches gets its types from the best real source available. Decide per library, in this order:
+Every library the converted code touches gets its types from the best real source available. The first move is always to import its own interfaces (`import type { Model, Document, Types } from 'mongoose'`) and compile. `skipLibCheck` is not a first step. Decide per library, in this order:
 
 1. **The package ships its own types** (a `types` field in its `package.json`, or an `index.d.ts`). Use them.
 2. **Otherwise, the official `@types/<name>` package,** pinned to the version that matches the library's major.
 3. **If those types fail to compile,** the errors point at files inside `node_modules`. Fix the versions first: a newer library major that ships working types, an `@types` version that matches the library, or the TypeScript major the types were written for. To find which library is failing, compile a probe file that imports just that library's types, with `skipLibCheck` off.
 4. **Only then, turn on `skipLibCheck`.** It stops tsc from checking every `.d.ts` file, your own included, but your code is still checked against those types. Record which library forced it in `.github/ts-migration.json` (`skipLibCheckBecause`), so someone can turn it off later. Run `tsc --skipLibCheck false` now and then to see what it hides. Keep your own types in `.ts` files, never `.d.ts`, so they're still checked.
 5. **No types exist at all:** leave the value honestly untyped (`any`), or put the library behind one small wrapper module whose functions you type and test. Never write an interface that describes the library's API.
+
+#### Fix as much as you can before `skipLibCheck`
+
+Don't turn it on at the first complaint.
+
+1. Count the errors with `npx tsc -p tsconfig.json --skipLibCheck false` and write the number down.
+2. Fix every error in your own code, or leave that value honestly untyped. `skipLibCheck` never hides errors in `.ts` files, so it is no help with them.
+3. Take the library errors one library at a time until you reach the end of the list: its own interfaces, `@types`, matching versions, and a package-manager `overrides` entry for a types package pulled in by another package. Don't stop at the first library that can't be fixed.
+4. Partial success counts. If 18 of 30 go away and 12 have no clean fix, keep the 18 fixes and turn on `skipLibCheck` for the rest.
+5. `skipLibCheck` is all or nothing, so write down what it now hides: `"skipLibCheckBecause": ["30 errors, 18 fixed, 12 left in <library>: <why>"]`. In later PRs, run with it off again. The number should not go up.
+
+A fix only counts if the types still describe the library you actually run:
+- **Fewer errors can mean fewer types.** Count again, then check where the module resolves (`npx tsc --traceResolution`). If it now resolves to a `.js` file, or to types for another major, you removed the types and everything from that library is `any`. Revert it.
+- **A runtime version change is not a type fix.** Upgrading or downgrading the library itself goes in its own tested PR.
 
 Old ORM versions are the usual trigger. Mongoose 5's bundled types, for example, fail under current TypeScript with errors that are all inside `node_modules`. Upgrading the ORM (phase 3) fixes it properly. `skipLibCheck` is the fallback, and hand-writing the ORM's types is never the answer.
 
@@ -135,18 +150,40 @@ node_modules/@types/mongodb/index.d.ts(1010,45): error TS2344: Type 'TSchema' do
 node_modules/mongoose/index.d.ts(332,116):     error TS2344: Type 'T' does not satisfy the constraint ...
 ```
 
-Every error is inside `node_modules`, so the library's types are failing, not your code. Step 1 (its own types) is what's failing. Step 2 doesn't apply, because Mongoose ships its own. Step 3: is a newer major an option now? If not, step 4:
+Every error is inside `node_modules`, so the library's types are failing, not your code. Step 1 (its own types) is what's failing. Step 2 doesn't apply, because Mongoose ships its own. Step 3, measured on Mongoose 5.13.23 with TypeScript 6.0.3, starting from 23 errors (16 in `@types/mongodb`, 7 in `mongoose`):
+
+| Tried | Errors | Counts as a fix? |
+|---|---|---|
+| `overrides` to `@types/mongodb` 3.5.34 | 23 | No change |
+| `overrides` to `@types/mongodb` 3.1.0 | 36 | Worse |
+| `overrides` to `@types/mongodb` 4.0.7 | 3 | No: it is an empty stub, so `mongodb` resolved to untyped JavaScript |
+| Mongoose 5.11.20 | 19 | No: a runtime change for 4 errors |
+
+So here nothing counts, and the honest record is 23 errors, 0 fixed. These are one setup's results, not yours: run your own count and trials before you record anything. Is a newer major an option now? If not, step 4:
 
 ```json
 // .github/ts-migration.json
-"skipLibCheckBecause": ["mongoose@5: bundled types fail under current TypeScript (TS2344 in @types/mongodb and mongoose/index.d.ts). Remove after the Mongoose upgrade."]
+"skipLibCheckBecause": ["mongoose@5.13: 23 errors, 0 fixed, 23 left (16 in @types/mongodb, 7 in mongoose/index.d.ts). No clean version fix. Remove after the Mongoose upgrade."]
 ```
 
 Then set `"skipLibCheck": true` in the tsconfig, and keep using `typeof import('mongoose')` everywhere. Your code is still checked against Mongoose's real types; only the library's internal errors are skipped.
 
 ## 3. Phases
 
-Each phase is its own PR, can ship on its own and can be reverted on its own.
+Each phase ships in its own PRs, and every PR can be reverted on its own.
+
+### Several PRs at once
+
+- **One PR is one safe, complete change:** usually one module with its exported type, the updated `require` paths, its test stubs and a test that pins its behaviour. If one interface goes in cleanly, stop there. Add a second file only when the two can't be separated safely. There is no target count.
+- **Every PR is finished on its own:** typecheck, tests, the runtime diff (`strip.js` in [Auditing a migration](#auditing-a-migration-thats-already-done)), the migration check, and a short description of what you verified.
+- **Every PR branches from the base branch and targets it.** Never stack one on another. If a module needs the exported type of a module whose PR is still open, it waits for that merge.
+- **The setup PR merges first** (tsconfig, check scripts, config). It also settles the libraries: probe every typed library the app requires, run the [library steps](#library-types-one-library-at-a-time) to the end, and include any `skipLibCheck` record. Nothing later should be waiting on a library error.
+- **Don't stop at a library error to ask.** An upgrade that would fix it is a recommendation in the PR description, not a blocker. Finish the steps, turn on `skipLibCheck` for what is left, and carry on.
+- **PRs open at the same time must merge cleanly in any order.** Before starting, list the files each planned PR will change, callers and tests included.
+- **Modules required by the same file go in one PR.** Their `require` lines sit together, so separate PRs would conflict, and queueing them one by one wastes a review round each. Together they are one safe unit. Other overlapping PRs run one after the other. Confirm with a trial merge of the planned branches.
+- **Open every PR that is ready now.** After the list, say what each pending module is waiting for, so the next batch can start as soon as that merges.
+- **Leave the `inProgress` list alone in parallel PRs.** Removing neighbouring lines in two branches conflicts. An entry for a file that is already converted does no harm, so clear them together in a later PR.
+- **Ask before publishing.** Show the person the list of planned PRs and get one yes before pushing or opening them. Never merge them yourself.
 
 0. **Type checking only.** Add `typescript`, `@types/node` (matching the production Node major) and the framework's `@types/*` as dev dependencies, the tsconfig, an `npm run typecheck` script (`tsc -p tsconfig.json`), and a typecheck step in the existing CI test job. Nothing in runtime changes.
    - Pin exact versions, and skip anything published in the last few days. Choose the TypeScript major on purpose: a new major can change how JS files are checked, so move to it in its own PR later.
@@ -155,8 +192,8 @@ Each phase is its own PR, can ship on its own and can be reverted on its own.
    - Run the first typecheck with `skipLibCheck` off. Handle any errors inside `node_modules` library by library ([Library types](#library-types-one-library-at-a-time)), never by hand-writing types to get past them.
    - Optionally turn on `// @ts-check` for a couple of tiny JS files. Under `strict`, a bare `@ts-check` fails on untyped `req`/`res`/`next` parameters, so add JSDoc types (comments only) rather than code changes.
 1. **Guardrails.** Add the migration-rules PR check from step 5, the queued-files list and the agent guidance. Also add the require-resolution check (both are in [Files to add](#files-to-add)). With `checkJs` off, tsc won't report a `.js` file that still requires a renamed module, and a missed rename crashes the app at boot. Don't count on a deploy healthcheck to catch that. If the repo uses nodemon, set its `ext` to `js,ts,json` so dev restarts on `.ts` changes.
-2. **Leaf modules,** one file per PR. Start with files that require no other app modules, then work inward: services, helpers, utilities. Write any new file as `.ts` from day one. Beyond typecheck and tests, deploy each one to staging and hit `/health` plus a few read-only endpoints of the module you changed.
-3. **Upgrade the ORM on its own,** before typing models, if its version has weak typings or open security advisories (for example Mongoose 5 to a supported major). Otherwise you type everything twice. Keep this PR in plain JS with no type work mixed in. Watch for removed callback APIs (code and tests that still pass a callback to `findOneAndUpdate`), changed `strictQuery` defaults, and changed return values from `lean()` and `findOneAndUpdate`. Verify on staging with read-only traffic, and remember that staging and production sometimes share a database cluster.
+2. **Leaf modules,** one safe unit per PR. Start with files that require no other app modules, then work inward: services, helpers, utilities. Write any new file as `.ts` from day one. Beyond typecheck and tests, deploy each one to staging and hit `/health` plus a few read-only endpoints of the module you changed.
+3. **Upgrade the ORM on its own,** if its version has weak typings or open security advisories (for example Mongoose 5 to a supported major) and the person wants it now. Doing it before typing models avoids typing things twice, but it doesn't block the migration: if it isn't happening yet, type the models with `skipLibCheck` and note the upgrade as follow-up work. Keep this PR in plain JS with no type work mixed in. Watch for removed callback APIs (code and tests that still pass a callback to `findOneAndUpdate`), changed `strictQuery` defaults, and changed return values from `lean()` and `findOneAndUpdate`. Verify on staging with read-only traffic, and remember that staging and production sometimes share a database cluster.
 4. **Models.** One interface per schema, passed to the ORM's own generics (`new Schema<T>()`, `model<T>()`), so every query is checked against the real ORM types. The interface describes the document, never the ORM's methods. It is still a second description of the same fields: on Mongoose 5 `new Schema<T>()` does not compare the schema with `T` (swapped, missing and extra fields all compile), so review the two side by side and change them in the same PR. Schemas with `strict: false` hold open-ended documents, so type them loosely: known fields plus an index signature. Don't change schema options or indexes in these PRs.
 5. **Routes, then small controllers, then the big ones last.** A shared CRUD factory becomes a generic over the ORM's model type (`Model<T>`), not a hand-written interface of the methods it calls. Split the largest controllers before converting them. Before converting a controller, add a test that pins its response shape.
 6. **Tighten.** Turn on the extra strict flags one at a time, turn `checkJs` on folder by folder for whatever JS is left, add request validation at the HTTP boundary (zod or similar), and leave the entry files (`app.js`, the APM and env bootstrap, `bin/www`) as plain JS.
@@ -169,7 +206,7 @@ Follow [Converting one file](#converting-one-file) for every file. The short ver
 2. Update every `require('./x')` to `require('./x.ts')`. Grep the source, the tests and any scripts.
 3. Grep `tests/` for stubs keyed on the old path (`Module._load`, proxyquire, `jest.mock`, regexes like `x(\.js)?$`). They silently stop matching after a rename.
 4. Run typecheck and the unit tests, then load the file in the production image (`node -e "require('./path/x.ts')"` with dummy env) to prove it resolves there.
-5. Remove the file from the queued list in the same PR.
+5. Remove the file from the queued list in the same PR, unless other conversion PRs are open (see [Several PRs at once](#several-prs-at-once)).
 
 ## 5. Migration rules PR check
 
@@ -179,10 +216,11 @@ Follow [Converting one file](#converting-one-file) for every file. The short ver
 - leaves a `.js` copy next to a converted `.ts` file;
 - edits a file queued for conversion, unless the PR has the migration label;
 - types a `require()` by hand in a `.ts` file (`const x: Foo = require('./foo.ts')` where `Foo` is neither `typeof …` nor imported with `import type` from that same module);
-- adds `!` non-null assertions or `as` casts (other than `as const`) in `.ts` lines, unless the line carries a `// ts-migration: <reason>` comment;
+- adds `!` non-null assertions or `as` casts (other than `as const` and `require('x') as typeof import('x')`) in `.ts` lines, unless the line carries a `// ts-migration: <reason>` comment;
+- adds a `declare module 'pkg' { ... }` block for a package, which replaces or rewrites its official types (a real augmentation, such as adding a field to Express's `Request`, carries the `// ts-migration:` comment);
 - turns on `skipLibCheck` without naming, in the config's `skipLibCheckBecause`, the library that forced it.
 
-The last three exist because an agent under pressure to make the compiler happy reaches for exactly those shortcuts. Each one compiles, and each one hides the check it was meant to pass. A prose rule can be argued with; a failing check can't.
+The last four exist because an agent under pressure to make the compiler happy reaches for exactly those shortcuts. Each one compiles, and each one hides the check it was meant to pass. A prose rule can be argued with; a failing check can't.
 
 Install it with the GitHub Actions workflow in [Files to add](#files-to-add). The messages state the rule, not a person. They also tell an AI coding agent to stop and point its user to the plan instead of working around the check. Add the short agent guidance as `AGENTS.md`, and the same few lines in `CLAUDE.md` if the repo has one. For a hard gate, the repo admin can pair this with branch protection.
 
@@ -199,7 +237,7 @@ Read [What breaks, and how to check](#what-breaks-and-how-to-check) before phase
 
 ## Converting one file
 
-Use this for every file. One file per PR keeps review small and makes a revert trivial.
+Use this for every file. A small PR (see [Several PRs at once](#several-prs-at-once)) keeps review small and makes a revert trivial.
 
 1. **Pick the file.** Prefer leaves: files that require little and are required by few. `grep -rn "require('.*/name')"` shows who depends on it.
 2. **Rename** with `git mv name.js name.ts`, so history follows the file.
@@ -208,7 +246,7 @@ Use this for every file. One file per PR keeps review small and makes a revert t
    - Keep the logic identical: the same comparisons (`==` stays `==` if it was there), the same truthiness checks, the same mutation of objects.
    - Keep `require` / `module.exports`. Keep the order of top-level requires.
    - Derive the type of everything you require: `typeof import('pkg')` for a package, or the sibling's exported `typeof` type. Never write an interface that describes a library or another module.
-   - Don't add `!` or `as` to get past an error. If the compiler forces a real change (a genuine bug), make it a separate commit with its own test, or a separate PR.
+   - Don't add `!` or `as` to get past an error. Narrow before reaching for `any`, when the behaviour stays identical. If the compiler forces a real change (a genuine bug), make it a separate commit with its own test, or a separate PR.
    - If this is the first file of its kind (the first model, the first controller), review it twice as hard. Every later conversion will copy whatever it does, shortcuts included.
 4. **Update callers.** Every `require('./name')` becomes `require('./name.ts')`. Search source, tests, scripts, seeders and anything that loads modules by path.
 5. **Update test stubs.** Search `tests/` for the old filename in `Module._load` hooks, proxyquire paths, `jest.mock` calls, or regexes like `name(\.js)?$`. A stub that stops matching doesn't fail; it quietly loads the real module. Keep test files `.js` if the test runner's glob only picks up `*.js`. For a module that writes to a cache or queue, add a test that pins the key names and encoding before converting it.
@@ -217,7 +255,7 @@ Use this for every file. One file per PR keeps review small and makes a revert t
    - Unit tests: the same passing count as before.
    - Production image: `docker run --rm -e <dummy env> <image> node -e "require('./path/name.ts')"` loads with no warnings.
    - For hot paths, one end-to-end run in throwaway containers (see SKILL.md step 6).
-7. **Bookkeeping.** Remove the file from `inProgress` in the migration config, and label the PR with the migration label.
+7. **Bookkeeping.** Label the PR with the migration label. Remove the file from `inProgress` in the migration config, unless other conversion PRs are open.
 8. **PR description.** One line up top saying it's a TypeScript conversion with no behaviour change, then what you verified.
 
 ## What breaks, and how to check
@@ -254,7 +292,7 @@ With `checkJs` off, tsc doesn't report a `require('./x')` in a `.js` file that n
 *Check:* add a small CI step that resolves every relative `require` in the repo (walk the files, `require.resolve` each path from its file's folder, fail on any miss), and boot-load changed files in the production image.
 
 ### ORM typings
-Old ORM versions have weak or broken types (Mongoose 5, for example). Typing models on them, then upgrading, is double work, and these versions often have security advisories anyway. Upgrade first, as its own tested PR. If you can't upgrade yet, follow [Library types](#library-types-one-library-at-a-time): `skipLibCheck` with the reason recorded, and the ORM's real types underneath.
+Old ORM versions have weak or broken types (Mongoose 5, for example). Typing models on them, then upgrading, is double work, and these versions often have security advisories anyway. Upgrade first if you can, as its own tested PR. If you can't upgrade yet, follow [Library types](#library-types-one-library-at-a-time): `skipLibCheck` with the reason recorded, and the ORM's real types underneath.
 
 ### Hand-written boundary types
 This is the most expensive mistake in an agent-run migration, and nothing in CI catches it on its own. The pattern:
@@ -276,6 +314,7 @@ Type stripping needs Node 22.18+ or 23.6+, and every image that might run the ap
 ### Fallback: a dist/ build
 Only use this if type stripping blocks something: old Node in production, or a dependency or feature that needs enums or decorators.
 - Compile with `tsc` (`allowJs`, CommonJS output) to `dist/`.
+- Here the way to get real types is `import mongoose = require('mongoose')` (and `export =`). Type stripping rejects that syntax, but a build compiles it. The rest of the type rules still apply, including `skipLibCheck` only after the library steps. A plain `require` with no annotation is still `any`.
 - Copy the static assets and any JSON read by path next to the output.
 - Keep dotenv and APM in a plain JS entry that loads first.
 - Turn source maps on for APM.
@@ -392,7 +431,9 @@ Write these into the target repo, adjusting paths and folder names to fit it.
 //  - a require() in a changed .ts file is never typed by hand: the type is `typeof ...`
 //    or comes from `import type` of that same module
 //  - no new `!` non-null assertions or `as` casts (except `as const`) in .ts lines the PR adds,
-//    unless the line has a `// ts-migration: <reason>` comment
+//    unless the line has a `// ts-migration: <reason>` comment. `require('x') as typeof import('x')`
+//    is allowed: the type comes from the same module that is required
+//  - no `declare module 'pkg' {` for a package, in .ts or .d.ts, without the same comment
 //  - skipLibCheck is only on when skipLibCheckBecause names the library that forced it
 // Env: BASE_REF (PR base branch, default main), PR_LABELS (comma separated).
 const { execSync } = require('child_process');
@@ -476,20 +517,28 @@ changedFiles().filter((c) => c.status !== 'D' && isTs(c.file) && fs.existsSync(p
 // New `!` and `as` in the .ts lines this PR adds.
 const NON_NULL = /[\w\])]!(?=[.[)\],;:\s]|$)/;
 const AS_CAST = /\bas\s+(?!const\b)[\w{[(]/;
+// require('x') as typeof import('x'): the same module on both sides, so nothing is hand-written.
+const DERIVED_REQUIRE = /require\(\s*(['"])([^'"]+)\1\s*\)\s+as\s+typeof\s+import\(\s*(['"])\2\3\s*\)/g;
 let file = null;
 let lineNo = 0;
 git('diff -U0 ' + base + '...HEAD -- "*.ts"').forEach((l) => {
   if (l.startsWith('+++ ')) { file = l.slice(4).replace(/^b\//, ''); return; }
   const hunk = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
   if (hunk) { lineNo = Number(hunk[1]); return; }
-  if (!l.startsWith('+') || !file || !isTs(file)) return;
+  if (!l.startsWith('+') || !file || !file.endsWith('.ts')) return;
   const text = l.slice(1);
   const at = file + ':' + lineNo;
   lineNo += 1;
   if (ALLOW.test(text)) return;
+  const declared = text.match(/^\s*declare\s+module\s+['"]([^.'"][^'"]*)['"]\s*\{/);
+  if (declared) {
+    problems.push(at + ': migration rule: hand-written types for the package ' + declared[1] +
+      '. Import its official types. If this only adds to them, add `// ts-migration: <reason>`.');
+  }
+  if (!isTs(file)) return;
   if (/^\s*(\/\*|\*)/.test(text)) return; // comment text, e.g. "same as before"
   if (/^\s*(type\s+)?[\w$]+\s+as\s+[\w$]+\s*,?\s*$/.test(text)) return; // `a as b,` inside a multi-line import
-  const code = codeOf(text);
+  const code = codeOf(text.replace(DERIVED_REQUIRE, 'require()'));
   if (/^\s*(import|export)\s/.test(code)) return; // `import { a as b }` renames, not casts
   if (NON_NULL.test(code)) {
     problems.push(at + ': migration rule: a new `!` non-null assertion hides what the compiler found. Keep the old behaviour without it, or add `// ts-migration: <reason>`.');
@@ -605,9 +654,11 @@ This codebase is being converted to TypeScript one file at a time. The plan is `
 - Files listed under `inProgress` in `.github/ts-migration.json` are queued for conversion. They only change in a migration PR, so don't edit or convert them as part of other work.
 - New files in the TypeScript-only folders (`tsOnlyDirs`) are `.ts`, run by Node's type stripping: erasable syntax only (types and interfaces, no enums, namespaces or parameter properties), CommonJS (`require` / `module.exports`), required with the `.ts` extension.
 - A converted file has no `.js` copy. Edit the `.ts` file.
-- Types for a package or another module are derived: `typeof import('pkg')`, or `import type` of the type the module exports as `typeof` itself. Never write an interface that describes a library's or another module's API, and never write `const x: SomeInterface = require(...)`.
-- Don't add `!` or `as` to make a type error go away. If the compiler found a real problem, say so and leave the fix for its own PR.
-- If a library's own type files fail to compile, don't work around it in code. Follow the library-types order in the plan: the package's own types, then `@types`, then matching versions, and `skipLibCheck` (with the reason recorded) last.
+- Import the library's or module's own TypeScript interfaces first (`import type { Model, Types } from 'mongoose'`). Types for a package or another module are derived: `typeof import('pkg')`, or `import type` of the type the module exports as `typeof` itself. Never write an interface that describes a library's or another module's API, and never write `const x: SomeInterface = require(...)`.
+- A hand-written type for an official package is always wrong, including `declare module 'pkg' { ... }`. Import the package's own types or its `@types`.
+- Don't add `!` or `as` to make a type error go away. Narrow if that behaves identically, otherwise `any`. If the compiler found a real problem, say so and leave the fix for its own PR.
+- One safe change per PR, branched from the base branch, never stacked. Ask before pushing or opening PRs, and never merge them.
+- If a library's own type files fail to compile, don't work around it in code. Follow the library-types order in the plan: the package's own types, then `@types`, then matching versions. Work through every library before turning on `skipLibCheck`, record how many errors you fixed and how many are left, and never count a change that just removes a library's types.
 - Keep `strict` as it is. Don't add stricter compiler flags during the migration.
 - If your task needs a queued file changed, stop and tell the person you're working for to check the migration plan, rather than working around the check.
 ```
@@ -620,3 +671,4 @@ This skill is meant to grow with real migrations. When a conversion teaches some
 - 2026-11: lessons from auditing an agent-run migration of a similar API.
   - What happened: one library type error (old ORM types under a newer TypeScript) led to hand-written library and module types behind `const x: T = require()`, which the compiler never checks. Of 8 tested against the real APIs, 5 didn't match. Strict-only flags were silenced with `!`. Reviews confirmed behaviour was unchanged, which was true, but never checked the types.
   - Added here: derive every type; the library-types order, with `skipLibCheck` last; no silencing; extra strict flags only at the end; the audit section; PR-check rules for all of it.
+- 2026-11: PRs can run in parallel off the base branch when they touch different files. Exhaust library fixes before `skipLibCheck`, and beware of fixes that lower the error count by removing types. Narrow before using `any`.
