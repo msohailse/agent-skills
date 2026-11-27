@@ -12,7 +12,7 @@ license_source: https://github.com/msohailse/agent-skills/blob/main/LICENSE
 compatibility: Node.js 22.18+ or 23.6+ (Node 24 recommended) for built-in type stripping; CommonJS codebases.
 metadata:
   author: Muhammad Sohail
-  version: '1.2'
+  version: '1.3'
 ---
 
 # JS to TS migration (Node type stripping, no build)
@@ -195,8 +195,22 @@ Each phase ships in its own PRs, and every PR can be reverted on its own.
 2. **Leaf modules,** one safe unit per PR. Start with files that require no other app modules, then work inward: services, helpers, utilities. Write any new file as `.ts` from day one. Beyond typecheck and tests, deploy each one to staging and hit `/health` plus a few read-only endpoints of the module you changed.
 3. **Upgrade the ORM on its own,** if its version has weak typings or open security advisories (for example Mongoose 5 to a supported major) and the person wants it now. Doing it before typing models avoids typing things twice, but it doesn't block the migration: if it isn't happening yet, type the models with `skipLibCheck` and note the upgrade as follow-up work. Keep this PR in plain JS with no type work mixed in. Watch for removed callback APIs (code and tests that still pass a callback to `findOneAndUpdate`), changed `strictQuery` defaults, and changed return values from `lean()` and `findOneAndUpdate`. Verify on staging with read-only traffic, and remember that staging and production sometimes share a database cluster.
 4. **Models.** One interface per schema, passed to the ORM's own generics (`new Schema<T>()`, `model<T>()`), so every query is checked against the real ORM types. The interface describes the document, never the ORM's methods. It is still a second description of the same fields: on Mongoose 5 `new Schema<T>()` does not compare the schema with `T` (swapped, missing and extra fields all compile), so review the two side by side and change them in the same PR. Schemas with `strict: false` hold open-ended documents, so type them loosely: known fields plus an index signature. Don't change schema options or indexes in these PRs.
-5. **Routes, then small controllers, then the big ones last.** A shared CRUD factory becomes a generic over the ORM's model type (`Model<T>`), not a hand-written interface of the methods it calls. Split the largest controllers before converting them. Before converting a controller, add a test that pins its response shape.
+5. **Routes, then small controllers, then the big ones last.** A shared CRUD factory becomes a generic over the ORM's model type (`Model<T>`), not a hand-written interface of the methods it calls. Split the largest controllers before converting them. Before converting a controller or changing a shared API, map its callers and write down what they depend on (see [Response shape drift](#response-shape-drift)), then add a test that pins it.
 6. **Tighten.** Turn on the extra strict flags one at a time, turn `checkJs` on folder by folder for whatever JS is left, add request validation at the HTTP boundary (zod or similar), and leave the entry files (`app.js`, the APM and env bootstrap, `bin/www`) as plain JS.
+
+### Working in rounds
+
+A migration takes several rounds, because a module can only be converted after what it requires has merged. Don't rely on memory between sessions: the repo says where you are. The setup PR lists every `.js` file to be converted in `inProgress`.
+
+Every time you are started, or told to continue, do one round:
+
+1. Pull the base branch.
+2. Look at the open migration PRs. Fix their failed checks and review comments before starting anything new.
+3. Run `node scripts/migration-status.js`. It prints what is ready, what is waiting and on which files, and which ready files belong in one PR.
+4. Open PRs for everything ready that doesn't already have one. If the script's "One PR" groups share files, don't chain them into one large PR: open the smallest safe group now, and the others in a later round.
+5. Report the PRs, what each waiting file needs merged, and that the next step is theirs: merge, then say "continue". Stop there.
+
+The migration is finished only when the script prints `Nothing left to convert`, typecheck and tests pass, and you have run the [audit](#auditing-a-migration-thats-already-done). Until then, don't call it done. In the last PR, clear `inProgress`.
 
 ## 4. Converting a file, in short
 
@@ -570,6 +584,53 @@ if (problems.length) {
 console.log('Migration rules met.');
 ```
 
+### `scripts/migration-status.js`
+
+Says where the migration stands, from the files themselves. A queued file is done once its `.js` no longer exists. It is ready when none of its relative requires points at a queued `.js` file.
+
+```js
+'use strict';
+
+// Where the migration stands. Reads inProgress from .github/ts-migration.json (override with
+// MIGRATION_CONFIG). Done = the queued .js no longer exists. Ready = requires no queued .js file.
+const fs = require('fs');
+const path = require('path');
+const { createRequire } = require('module');
+
+const root = process.cwd();
+const config = JSON.parse(fs.readFileSync(path.join(root, process.env.MIGRATION_CONFIG || '.github/ts-migration.json'), 'utf8'));
+const queued = config.inProgress || [];
+const left = queued.filter((f) => fs.existsSync(path.join(root, f)));
+
+function deps(file) {
+  const abs = path.join(root, file);
+  const src = fs.readFileSync(abs, 'utf8').replace(/^\s*\/\/.*$/gm, '');
+  const req = createRequire(abs);
+  const found = [];
+  for (const m of src.matchAll(/require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)/g)) {
+    try { found.push(path.relative(fs.realpathSync(root), req.resolve(m[1])).split(path.sep).join('/')); } catch (e) { /* check-requires reports it */ }
+  }
+  return found;
+}
+
+console.log('Converted: ' + (queued.length - left.length) + ' of ' + queued.length);
+if (!left.length) {
+  console.log('Nothing left to convert.');
+  process.exit(0);
+}
+const waiting = new Map(left.map((f) => [f, deps(f).filter((d) => left.indexOf(d) > -1)]));
+const ready = left.filter((f) => !waiting.get(f).length);
+console.log('Ready now:');
+ready.forEach((f) => console.log('  - ' + f));
+left.filter((f) => ready.indexOf(f) === -1).forEach((f) => console.log('Waiting: ' + f + ' (needs ' + waiting.get(f).join(', ') + ')'));
+// Ready files required by the same file go in one PR: their require lines sit together.
+left.forEach((f) => {
+  const together = waiting.get(f).filter((d) => ready.indexOf(d) > -1);
+  if (together.length > 1) console.log('One PR: ' + together.join(', ') + ' (all required by ' + f + ')');
+});
+if (!ready.length) console.log('Nothing is ready: the files left require each other. Convert that cycle in one PR.');
+```
+
 ### `scripts/check-requires.js`
 
 Fails when a relative `require()` in a tracked `.js` or `.ts` file no longer resolves under Node's own rules, for example a caller still requiring `./x` after `x.js` became `x.ts`. Run it in the same workflow as the rules check.
@@ -660,6 +721,7 @@ This codebase is being converted to TypeScript one file at a time. The plan is `
 - One safe change per PR, branched from the base branch, never stacked. Ask before pushing or opening PRs, and never merge them.
 - If a library's own type files fail to compile, don't work around it in code. Follow the library-types order in the plan: the package's own types, then `@types`, then matching versions. Work through every library before turning on `skipLibCheck`, record how many errors you fixed and how many are left, and never count a change that just removes a library's types.
 - Keep `strict` as it is. Don't add stricter compiler flags during the migration.
+- To continue the migration, do one round: update open migration PRs, run `node scripts/migration-status.js`, open PRs for what is ready, report, and stop. It isn't done until that script prints `Nothing left to convert`.
 - If your task needs a queued file changed, stop and tell the person you're working for to check the migration plan, rather than working around the check.
 ```
 
@@ -672,3 +734,4 @@ This skill is meant to grow with real migrations. When a conversion teaches some
   - What happened: one library type error (old ORM types under a newer TypeScript) led to hand-written library and module types behind `const x: T = require()`, which the compiler never checks. Of 8 tested against the real APIs, 5 didn't match. Strict-only flags were silenced with `!`. Reviews confirmed behaviour was unchanged, which was true, but never checked the types.
   - Added here: derive every type; the library-types order, with `skipLibCheck` last; no silencing; extra strict flags only at the end; the audit section; PR-check rules for all of it.
 - 2026-11: PRs can run in parallel off the base branch when they touch different files. Exhaust library fixes before `skipLibCheck`, and beware of fixes that lower the error count by removing types. Narrow before using `any`.
+- 2026-11: the migration runs in rounds, with `scripts/migration-status.js` saying what is ready next, and callers are mapped before a shared API changes.
