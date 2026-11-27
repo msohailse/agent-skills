@@ -12,7 +12,7 @@ license_source: https://github.com/msohailse/agent-skills/blob/main/LICENSE
 compatibility: Node.js 22.18+ or 23.6+ (Node 24 recommended) for built-in type stripping; CommonJS codebases.
 metadata:
   author: Muhammad Sohail
-  version: '1.3'
+  version: '1.3.1'
 ---
 
 # JS to TS migration (Node type stripping, no build)
@@ -210,7 +210,7 @@ Every time you are started, or told to continue, do one round:
 4. Open PRs for everything ready that doesn't already have one. If the script's "One PR" groups share files, don't chain them into one large PR: open the smallest safe group now, and the others in a later round.
 5. Report the PRs, what each waiting file needs merged, and that the next step is theirs: merge, then say "continue". Stop there.
 
-The migration is finished only when the script prints `Nothing left to convert`, typecheck and tests pass, and you have run the [audit](#auditing-a-migration-thats-already-done). Until then, don't call it done. In the last PR, clear `inProgress`.
+The migration is finished only when the script prints `Nothing left to convert`, typecheck and tests pass, and you have run the [audit](#auditing-a-migration-thats-already-done) and reported its three counts in the last PR. The script's message is a prompt to audit, not the finish line. Until then, don't call it done. In the last PR, clear `inProgress`.
 
 ## 4. Converting a file, in short
 
@@ -586,7 +586,7 @@ console.log('Migration rules met.');
 
 ### `scripts/migration-status.js`
 
-Says where the migration stands, from the files themselves. A queued file is done once its `.js` no longer exists. It is ready when none of its relative requires points at a queued `.js` file.
+Says where the migration stands, from the files themselves. A queued file is done once its `.js` no longer exists, or once it has been removed from the list. It is ready when none of its relative requires points at a queued `.js` file.
 
 ```js
 'use strict';
@@ -613,9 +613,9 @@ function deps(file) {
   return found;
 }
 
-console.log('Converted: ' + (queued.length - left.length) + ' of ' + queued.length);
+console.log('Left to convert: ' + left.length);
 if (!left.length) {
-  console.log('Nothing left to convert.');
+  console.log('Nothing left to convert. This is not "done": run the audit now (hand-typed requires, ! and as, and how many errors skipLibCheck hides) and report all three counts.');
   process.exit(0);
 }
 const waiting = new Map(left.map((f) => [f, deps(f).filter((d) => left.indexOf(d) > -1)]));
